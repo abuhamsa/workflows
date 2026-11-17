@@ -3,8 +3,9 @@
 #
 # Versions: every push to the default branch becomes the next patch release
 # (git tag v1.1.0 -> v1.1.1, image tag 1.1.1, plus 1.1, 1 and sha-<commit>).
-# Minor/major: push a tag yourself (git tag v1.2.0 && git push origin v1.2.0);
-# the next push to the default branch continues at 1.2.1.
+# Minor/major: put "#minor" or "#major" in the commit message - for a merged PR,
+# in the PR title (v1.1.4 -> v1.2.0 / v2.0.0). Or push a tag yourself
+# (git tag v1.2.0 && git push origin v1.2.0); the next push continues at 1.2.1.
 #
 # Pull requests: build only, nothing is pushed, tagged or deployed.
 # Other branches: images are pushed as sha-<commit>, nothing is deployed.
@@ -149,14 +150,25 @@ jobs:
               # Commit already released (manual tag, re-run)? Reuse that version.
               git_tag="$(git tag --points-at HEAD -l 'v*' --sort=-v:refname | grep -E "$semver" | head -1 || true)"
               if [[ -z "$git_tag" ]]; then
-                # Next patch after the highest final release, e.g. v1.1.0 -> v1.1.1.
+                # Next version after the highest final release: patch by default
+                # (v1.1.0 -> v1.1.1); "#minor" / "#major" in the commit message (for a
+                # GitHub merge: in the PR title) bumps that part instead.
                 last="$(git tag -l 'v*' --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1 || true)"
+                msg="$(git log -1 --format=%B HEAD)"
+                bump=patch
+                if grep -qiE '#major\b' <<< "$msg"; then bump=major
+                elif grep -qiE '#minor\b' <<< "$msg"; then bump=minor; fi
                 if [[ -z "$last" ]]; then
                   git_tag="v${INITIAL_VERSION#v}"
                 else
                   IFS=. read -r major minor patch <<< "${last#v}"
-                  git_tag="v${major}.${minor}.$((patch + 1))"
+                  case "$bump" in
+                    major) git_tag="v$((major + 1)).0.0" ;;
+                    minor) git_tag="v${major}.$((minor + 1)).0" ;;
+                    *)     git_tag="v${major}.${minor}.$((patch + 1))" ;;
+                  esac
                 fi
+                echo "Bump: $bump"
                 create_tag=true
               fi
             fi
