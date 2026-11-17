@@ -12,7 +12,8 @@ runs, and a rollback is a `git revert` there.
 | Event | Images | Git tag | Deploy |
 | --- | --- | --- | --- |
 | Push to default branch | `1.0.4`, `1.0`, `1`, `sha-<commit>` | `v1.0.4` (next patch, created after a successful build) | `1.0.4` |
-| Tag `v1.1.0` (minor/major) | `1.1.0`, `1.1`, `1`, `sha-<commit>` | - | `1.1.0` |
+| Push with `#minor` / `#major` in the commit message (merged PR: in the PR title) | `1.1.0` / `2.0.0`, … | `v1.1.0` / `v2.0.0` | `1.1.0` / `2.0.0` |
+| Tag `v1.1.0` pushed by hand | `1.1.0`, `1.1`, `1`, `sha-<commit>` | - | `1.1.0` |
 | Push to another branch | `sha-<commit>` | - | - |
 | Pull request | built, not pushed | - | - |
 

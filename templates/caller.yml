@@ -2,7 +2,7 @@
 # Every push to the default branch becomes the next patch release (v1.0.3 -> v1.0.4):
 # builds ghcr.io/<owner>/<repo>:1.0.4, tags the commit and pins 1.0.4 in the GitOps
 # repo (stacks/<repo>/compose.yaml) -> Dockhand redeploys.
-# Minor/major: git tag v1.1.0 && git push origin v1.1.0
+# Minor/major: "#minor" / "#major" in the PR title (or commit message)
 name: build-deploy
 
 on:
