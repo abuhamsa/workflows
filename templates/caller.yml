@@ -1,0 +1,41 @@
+# Copy to <project>/.github/workflows/build-deploy.yml
+# Every push to the default branch becomes the next patch release (v1.0.3 -> v1.0.4):
+# builds ghcr.io/<owner>/<repo>:1.0.4, tags the commit and pins 1.0.4 in the GitOps
+# repo (stacks/<repo>/compose.yaml) -> Dockhand redeploys.
+# Minor/major: git tag v1.1.0 && git push origin v1.1.0
+name: build-deploy
+
+on:
+  push:
+    branches: [main] # adjust if the default branch is master
+    tags: ["v*"]
+  pull_request: # build only, nothing is pushed or deployed
+  workflow_dispatch:
+
+# Required: runs of one ref must not overlap, or two of them would compute the same version.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: write # release tags
+  packages: write
+
+jobs:
+  build-deploy:
+    uses: abuhamsa/workflows/.github/workflows/build-deploy.yml@main
+    # Only set what differs from the convention:
+    # with:
+    #   image_name: my-app                        # default: repo name
+    #   context: ./app                            # default: .
+    #   dockerfile: ./docker/Dockerfile           # default: <context>/Dockerfile
+    #   images: |                                 # several images instead of the three above
+    #     my-app-backend  ./backend
+    #     my-app-frontend ./frontend
+    #   stack_name: my-app                        # default: image name (repo name with `images`)
+    #   stack_path: stacks/my-app/compose.yaml    # default: stacks/<stack_name>/compose.yaml
+    #   platforms: linux/amd64,linux/arm64        # default: runner platform
+    #   auto_version: false                       # default: true
+    #   initial_version: 0.1.0                    # default: 1.0.0 (first version without any v* tag)
+    secrets:
+      GITOPS_TOKEN: ${{ secrets.GITOPS_TOKEN }}

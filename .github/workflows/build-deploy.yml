@@ -1,0 +1,351 @@
+# Reusable: build a project's image(s), push them to ghcr.io and pin the new
+# version in the GitOps repo, where Dockhand picks it up via its webhook.
+#
+# Versions: every push to the default branch becomes the next patch release
+# (git tag v1.1.0 -> v1.1.1, image tag 1.1.1, plus 1.1, 1 and sha-<commit>).
+# Minor/major: push a tag yourself (git tag v1.2.0 && git push origin v1.2.0);
+# the next push to the default branch continues at 1.2.1.
+#
+# Pull requests: build only, nothing is pushed, tagged or deployed.
+# Other branches: images are pushed as sha-<commit>, nothing is deployed.
+#
+# Callers: see templates/ and README.md. They need
+#   permissions: { contents: write, packages: write }
+# and a workflow-level concurrency group, so that two runs never compute the
+# same version.
+name: build-deploy
+
+on:
+  workflow_call:
+    inputs:
+      image_name:
+        description: "Single image: name under ghcr.io/<owner>/ (default: repo name)"
+        type: string
+        default: ""
+      context:
+        description: "Single image: build context"
+        type: string
+        default: .
+      dockerfile:
+        description: "Single image: Dockerfile (default: <context>/Dockerfile)"
+        type: string
+        default: ""
+      images:
+        description: |
+          Several images instead of image_name/context/dockerfile, one per line:
+            <name> <context> [<dockerfile>]
+          e.g. "my-app-backend ./backend"
+        type: string
+        default: ""
+      stack_name:
+        description: "Stack in the GitOps repo (default: image name, or repo name with `images`)"
+        type: string
+        default: ""
+      stack_path:
+        description: "Compose file in the GitOps repo (default: stacks/<stack_name>/compose.yaml)"
+        type: string
+        default: ""
+      platforms:
+        description: "e.g. linux/amd64,linux/arm64 (default: runner platform)"
+        type: string
+        default: ""
+      auto_version:
+        description: "Pushes to the default branch become the next patch release"
+        type: boolean
+        default: true
+      initial_version:
+        description: "First version if the repo has no v* tag yet"
+        type: string
+        default: 1.0.0
+      gitops_repo:
+        type: string
+        default: abuhamsa/riftbase
+      gitops_branch:
+        type: string
+        default: main
+    secrets:
+      GITOPS_TOKEN:
+        description: "Fine-grained PAT, Contents read/write on the GitOps repo only (not needed for PRs)"
+        required: false
+    outputs:
+      version:
+        description: "Deployed tag (e.g. 1.0.4), or sha-<commit>"
+        value: ${{ jobs.prepare.outputs.deploy_tag }}
+      deployed:
+        value: ${{ jobs.prepare.outputs.deploy }}
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      matrix: ${{ steps.vars.outputs.matrix }}
+      images: ${{ steps.vars.outputs.images }}
+      suffixes: ${{ steps.vars.outputs.suffixes }}
+      deploy_tag: ${{ steps.vars.outputs.deploy_tag }}
+      git_tag: ${{ steps.vars.outputs.git_tag }}
+      create_tag: ${{ steps.vars.outputs.create_tag }}
+      push: ${{ steps.vars.outputs.push }}
+      deploy: ${{ steps.vars.outputs.deploy }}
+      stack_name: ${{ steps.vars.outputs.stack_name }}
+      stack_path: ${{ steps.vars.outputs.stack_path }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # tags, for the version bump
+
+      - name: Resolve images, version and tags
+        id: vars
+        env:
+          IN_IMAGE: ${{ inputs.image_name }}
+          IN_CONTEXT: ${{ inputs.context }}
+          IN_DOCKERFILE: ${{ inputs.dockerfile }}
+          IN_IMAGES: ${{ inputs.images }}
+          IN_STACK_NAME: ${{ inputs.stack_name }}
+          IN_STACK_PATH: ${{ inputs.stack_path }}
+          AUTO_VERSION: ${{ inputs.auto_version }}
+          INITIAL_VERSION: ${{ inputs.initial_version }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          repo="${GITHUB_REPOSITORY#*/}"
+          repo="${repo,,}"
+
+          # ---- images: "name context dockerfile" lines ------------------------
+          spec="$IN_IMAGES"
+          if [[ -z "${spec//[[:space:]]/}" ]]; then
+            spec="${IN_IMAGE:-$repo} ${IN_CONTEXT:-.} ${IN_DOCKERFILE}"
+            default_stack="${IN_IMAGE:-$repo}"
+          else
+            default_stack="$repo"
+          fi
+          matrix="[]"
+          images=""
+          while read -r name context dockerfile _; do
+            [[ -z "${name:-}" || "$name" == \#* ]] && continue
+            name="${name,,}"
+            context="${context:-.}"
+            dockerfile="${dockerfile:-${context%/}/Dockerfile}"
+            matrix="$(jq -c --arg n "$name" --arg i "ghcr.io/$owner/$name" --arg c "$context" --arg f "$dockerfile" \
+              '. + [{name: $n, image: $i, context: $c, dockerfile: $f}]' <<< "$matrix")"
+            images+="ghcr.io/$owner/$name "
+          done <<< "$spec"
+          [[ "$matrix" != "[]" ]] || { echo "::error::no images given"; exit 1; }
+
+          # ---- version ----------------------------------------------------------
+          semver='^v([0-9]+)\.([0-9]+)\.([0-9]+)(-[0-9A-Za-z.-]+)?$'
+          on_default=false
+          [[ "$GITHUB_REF_TYPE" == branch && "$GITHUB_REF_NAME" == "$DEFAULT_BRANCH" ]] && on_default=true
+
+          git_tag=""      # v* tag this build is released as
+          create_tag=""   # set when this run has to create (and push) git_tag
+          if [[ "$EVENT" != pull_request ]]; then
+            if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+              [[ "$GITHUB_REF_NAME" =~ $semver ]] && git_tag="$GITHUB_REF_NAME"
+            elif [[ "$AUTO_VERSION" == true && "$on_default" == true ]]; then
+              # Commit already released (manual tag, re-run)? Reuse that version.
+              git_tag="$(git tag --points-at HEAD -l 'v*' --sort=-v:refname | grep -E "$semver" | head -1 || true)"
+              if [[ -z "$git_tag" ]]; then
+                # Next patch after the highest final release, e.g. v1.1.0 -> v1.1.1.
+                last="$(git tag -l 'v*' --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1 || true)"
+                if [[ -z "$last" ]]; then
+                  git_tag="v${INITIAL_VERSION#v}"
+                else
+                  IFS=. read -r major minor patch <<< "${last#v}"
+                  git_tag="v${major}.${minor}.$((patch + 1))"
+                fi
+                create_tag=true
+              fi
+            fi
+          fi
+
+          # Always also tagged sha-<commit>, so every image maps back to its commit.
+          suffixes="sha-${GITHUB_SHA::7}"
+          deploy_tag="sha-${GITHUB_SHA::7}"
+          if [[ -n "$git_tag" && "$git_tag" =~ $semver ]]; then
+            version="${git_tag#v}"
+            suffixes="$version $suffixes"
+            # Final releases also move the 1.2 and 1 tags.
+            if [[ -z "${BASH_REMATCH[4]}" ]]; then
+              suffixes+=" ${BASH_REMATCH[1]}.${BASH_REMATCH[2]} ${BASH_REMATCH[1]}"
+            fi
+            deploy_tag="$version"
+          fi
+
+          push=false
+          [[ "$EVENT" != pull_request ]] && push=true
+          # Deploy releases only; other branches just publish sha-<commit>.
+          deploy=false
+          [[ "$push" == true && -n "$git_tag" ]] && deploy=true
+
+          stack_name="${IN_STACK_NAME:-$default_stack}"
+          {
+            echo "matrix=$matrix"
+            echo "images=${images% }"
+            echo "suffixes=$suffixes"
+            echo "deploy_tag=$deploy_tag"
+            echo "git_tag=$git_tag"
+            echo "create_tag=$create_tag"
+            echo "push=$push"
+            echo "deploy=$deploy"
+            echo "stack_name=$stack_name"
+            echo "stack_path=${IN_STACK_PATH:-stacks/${stack_name}/compose.yaml}"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Images:   ${images% }"
+          echo "Tags:     $suffixes"
+          echo "Push:     $push"
+          echo "Deploy:   $deploy ($deploy_tag)"
+          [[ -n "$create_tag" ]] && echo "Release:  $git_tag (new)" || true
+
+  build:
+    needs: prepare
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: true
+      matrix:
+        include: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    name: build (${{ matrix.name }})
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-qemu-action@v4
+        if: inputs.platforms != ''
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        if: needs.prepare.outputs.push == 'true'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ matrix.image }}
+
+      - name: Tags
+        id: tags
+        env:
+          IMAGE: ${{ matrix.image }}
+          SUFFIXES: ${{ needs.prepare.outputs.suffixes }}
+        run: |
+          {
+            echo "list<<EOF"
+            for s in $SUFFIXES; do echo "$IMAGE:$s"; done
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: docker/build-push-action@v7
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          platforms: ${{ inputs.platforms }}
+          push: ${{ needs.prepare.outputs.push == 'true' }}
+          tags: ${{ steps.tags.outputs.list }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Optional for the app: `ARG APP_VERSION` in the Dockerfile to show the
+          # running version (e.g. 1.0.4). Ignored if the Dockerfile doesn't declare it.
+          build-args: |
+            APP_VERSION=${{ needs.prepare.outputs.deploy_tag }}
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+
+  release:
+    needs: [prepare, build]
+    if: needs.prepare.outputs.deploy == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # push the release tag
+    steps:
+      # After all builds succeeded, so failed builds don't use up version numbers.
+      # Tags pushed with GITHUB_TOKEN don't trigger another workflow run.
+      - uses: actions/checkout@v7
+        if: needs.prepare.outputs.create_tag == 'true'
+
+      - name: Create release tag
+        if: needs.prepare.outputs.create_tag == 'true'
+        env:
+          GIT_TAG: ${{ needs.prepare.outputs.git_tag }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$GIT_TAG" -m "$GIT_TAG" "$GITHUB_SHA"
+          git push origin "refs/tags/$GIT_TAG"
+
+      - name: Check GITOPS_TOKEN
+        env:
+          TOKEN: ${{ secrets.GITOPS_TOKEN }}
+        run: |
+          [ -n "$TOKEN" ] || { echo "::error::secret GITOPS_TOKEN is not set in this repo"; exit 1; }
+
+      - name: Check out GitOps repo
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ inputs.gitops_repo }}
+          ref: ${{ inputs.gitops_branch }}
+          token: ${{ secrets.GITOPS_TOKEN }}
+          path: gitops
+
+      - name: Pin version in GitOps repo
+        working-directory: gitops
+        env:
+          IMAGES: ${{ needs.prepare.outputs.images }}
+          NAME: ${{ needs.prepare.outputs.stack_name }}
+          TAG: ${{ needs.prepare.outputs.deploy_tag }}
+          STACK: ${{ needs.prepare.outputs.stack_path }}
+          BRANCH: ${{ inputs.gitops_branch }}
+          SOURCE: ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Only lines whose image is exactly <image>:<tag>; other images in the
+          # same file (and e.g. <image>-worker) stay untouched.
+          pin() {
+            if [ ! -f "$STACK" ]; then
+              echo "::error::$STACK not found in the GitOps repo"; exit 1
+            fi
+            for image in $IMAGES; do
+              image_re="${image//./\\.}"
+              line_re="^([[:space:]]*-?[[:space:]]*image:[[:space:]]*[\"']?)${image_re}:[^\"'[:space:]#]+"
+              if ! grep -Eq "$line_re" "$STACK"; then
+                echo "::error::no 'image: $image:<tag>' line in $STACK"; exit 1
+              fi
+              sed -E -i "s|${line_re}|\\1${image}:${TAG}|" "$STACK"
+            done
+          }
+
+          for attempt in 1 2 3 4 5; do
+            pin
+            if git diff --quiet -- "$STACK"; then
+              echo "$STACK already on $TAG - nothing to commit."
+              exit 0
+            fi
+            # Changed lines only: the logs of public repos are public, so no
+            # surrounding compose content (paths, env) ends up in them.
+            git diff -U0 --no-prefix -- "$STACK" | grep -E '^[-+][^-+]' || true
+            git commit -q -m "$NAME -> $TAG" -m "Source: $SOURCE" -- "$STACK"
+            if git push -q origin "HEAD:$BRANCH"; then
+              echo "Pinned $TAG in $STACK"
+              exit 0
+            fi
+            # Someone pushed in between: re-apply the change on top of the new
+            # head (never conflicts), then retry.
+            echo "Push rejected (attempt $attempt), retrying on top of the new $BRANCH"
+            sleep $((attempt * 3))
+            git fetch -q origin "$BRANCH"
+            git reset -q --hard FETCH_HEAD
+          done
+          echo "::error::could not push to $BRANCH after 5 attempts"
+          exit 1

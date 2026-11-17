@@ -1,0 +1,32 @@
+# Like caller.yml, but the images are only built once the project's tests pass.
+name: build-deploy
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: write # release tags
+  packages: write
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - run: echo "run your tests here"
+
+  build-deploy:
+    needs: [tests]
+    uses: abuhamsa/workflows/.github/workflows/build-deploy.yml@main
+    secrets:
+      GITOPS_TOKEN: ${{ secrets.GITOPS_TOKEN }}
