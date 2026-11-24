@@ -37,5 +37,6 @@ jobs:
     #   platforms: linux/amd64,linux/arm64        # default: runner platform
     #   auto_version: false                       # default: true
     #   initial_version: 0.1.0                    # default: 1.0.0 (first version without any v* tag)
+    #   gitops: false                             # build/push/tag only, no GitOps commit or GITOPS_TOKEN
     secrets:
       GITOPS_TOKEN: ${{ secrets.GITOPS_TOKEN }}
