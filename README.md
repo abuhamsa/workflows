@@ -36,3 +36,19 @@ images. The logs only show those lines, so public repos don't expose the compose
 3. The stack needs to exist in the GitOps repo with the images written out in full
    (`image: ghcr.io/<owner>/<name>:<some tag>`). How to set it up in Dockhand is described in
    the GitOps repo's README.
+
+### Build only (no GitOps deploy)
+
+For images you only want to pull (no stack in the GitOps repo), set `gitops: false`. Versions,
+image tags and release tags work as above. Only the GitOps commit is skipped, so no
+`GITOPS_TOKEN` and no stack are needed:
+
+```yaml
+jobs:
+  build-deploy:
+    uses: abuhamsa/workflows/.github/workflows/build-deploy.yml@main
+    with:
+      gitops: false
+```
+
+Deploying it through the GitOps repo later: remove `gitops: false`, add the stack and the secret.

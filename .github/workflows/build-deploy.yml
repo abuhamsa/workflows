@@ -7,6 +7,9 @@
 # in the PR title (v1.1.4 -> v1.2.0 / v2.0.0). Or push a tag yourself
 # (git tag v1.2.0 && git push origin v1.2.0); the next push continues at 1.2.1.
 #
+# Build-only projects (not deployed via the GitOps repo) set gitops: false:
+# same versions, images and release tags, no GitOps commit, no GITOPS_TOKEN.
+#
 # Pull requests: build only, nothing is pushed, tagged or deployed.
 # Other branches: images are pushed as sha-<commit>, nothing is deployed.
 #
@@ -58,6 +61,10 @@ on:
         description: "First version if the repo has no v* tag yet"
         type: string
         default: 1.0.0
+      gitops:
+        description: "Pin releases in the GitOps repo. false = build, push and tag only (no GITOPS_TOKEN needed)"
+        type: boolean
+        default: true
       gitops_repo:
         type: string
         default: abuhamsa/riftbase
@@ -294,13 +301,16 @@ jobs:
           git tag -a "$GIT_TAG" -m "$GIT_TAG" "$GITHUB_SHA"
           git push origin "refs/tags/$GIT_TAG"
 
+      # gitops: false (build-only projects): the release ends with the tag above.
       - name: Check GITOPS_TOKEN
+        if: inputs.gitops
         env:
           TOKEN: ${{ secrets.GITOPS_TOKEN }}
         run: |
           [ -n "$TOKEN" ] || { echo "::error::secret GITOPS_TOKEN is not set in this repo"; exit 1; }
 
       - name: Check out GitOps repo
+        if: inputs.gitops
         uses: actions/checkout@v7
         with:
           repository: ${{ inputs.gitops_repo }}
@@ -309,6 +319,7 @@ jobs:
           path: gitops
 
       - name: Pin version in GitOps repo
+        if: inputs.gitops
         working-directory: gitops
         env:
           IMAGES: ${{ needs.prepare.outputs.images }}
